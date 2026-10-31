@@ -3,7 +3,7 @@
 #
 #  COMO ABRIR: dê dois cliques neste arquivo (ou, no terminal: python app.py).
 #  Na primeira vez ele instala o que falta (Streamlit, pandas, openpyxl,
-#  reportlab, xlrd) e
+#  reportlab, xlrd, plotly) e
 #  depois abre o painel no navegador. Deixe a janela preta aberta enquanto
 #  usa o painel; fechar a janela encerra o painel.
 #
@@ -33,7 +33,7 @@ def _abrir_painel():
     print("=" * 60)
 
     # 1. Instala o que estiver faltando (só na primeira vez)
-    instalar = [p for p in ("streamlit", "pandas", "openpyxl", "reportlab", "xlrd") if importlib.util.find_spec(p) is None]
+    instalar = [p for p in ("streamlit", "pandas", "openpyxl", "reportlab", "xlrd", "plotly") if importlib.util.find_spec(p) is None]
     if "streamlit" not in instalar:
         principal, secundaria = (int(x) for x in version("streamlit").split(".")[:2])
         if (principal, secundaria) < (1, 37):
@@ -1162,6 +1162,12 @@ CREATE TABLE IF NOT EXISTS layout_importacao (
     config TEXT NOT NULL,                -- colunas escolhidas na última importação (JSON)
     atualizado_em TEXT
 );
+CREATE TABLE IF NOT EXISTS saldos_iniciais (
+    cliente_id INTEGER NOT NULL REFERENCES clientes(id),
+    competencia TEXT NOT NULL,           -- saldo em banco no 1º dia deste mês
+    valor REAL NOT NULL,
+    PRIMARY KEY (cliente_id, competencia)
+);
 CREATE TABLE IF NOT EXISTS parametros_mes (
     cliente_id INTEGER NOT NULL REFERENCES clientes(id),
     competencia TEXT NOT NULL,
@@ -1320,6 +1326,112 @@ def totais_por_categoria(con, cliente_id: int, competencia: str = None) -> pd.Da
             GROUP BY l.categoria, m.linha ORDER BY l.categoria""",
         con, params=params,
     )
+
+
+# ------------------------------------------------------------ fluxo de caixa
+# Agrupamento da DFC gerencial (não altera a DRE: só lê os mesmos lançamentos).
+GRUPO_DFC = {
+    "receita_bruta": "Operacional", "impostos_vendas": "Operacional", "custos_variaveis": "Operacional",
+    "despesas_variaveis": "Operacional", "custos_fixos": "Operacional", "receitas_financeiras": "Operacional",
+    "despesas_financeiras": "Operacional", "impostos_lucro": "Operacional",
+    "investimentos": "Investimentos",
+    "amortizacao_emprestimos": "Financiamento e Sócios", "distribuicao_lucros": "Financiamento e Sócios",
+}
+ORDEM_DFC = ["Operacional", "Investimentos", "Financiamento e Sócios", "Não classificado"]
+SEM_CLASSIFICACAO = "Sem classificação"
+
+
+def lancamentos_caixa(con, cliente_id: int, competencia: str) -> pd.DataFrame:
+    """Lançamentos do mês com o efeito no caixa: + entrada, - saída.
+    Usa o mesmo valor-na-natureza da DRE (estornos já compensados). Ficam de fora transferências
+    entre contas (ignorar) e depreciação (não mexe no caixa). Categorias sem classificação entram
+    pelo sinal do arquivo; se o arquivo não tinha sinal, ficam de fora (avisadas na tela)."""
+    df = pd.read_sql(
+        f"""SELECT l.data, l.categoria, l.descricao, l.valor, COALESCE(l.sinal_confiavel, 1) AS sinal_confiavel,
+                   m.linha, {VALOR_NA_LINHA_SQL} AS valor_dre
+            FROM lancamentos l
+            LEFT JOIN mapeamento m ON m.cliente_id = l.cliente_id AND m.categoria = l.categoria
+            WHERE l.cliente_id = ? AND l.competencia = ?
+            ORDER BY l.data, l.id""",
+        con, params=(cliente_id, competencia),
+    )
+    if df.empty:
+        return df.assign(caixa=pd.Series(dtype=float), grupo=pd.Series(dtype=str))
+    df = df[~df["linha"].isin(["ignorar", "depreciacao"])].copy()
+    credora = df["linha"].isin(LINHAS_CREDORAS)
+    df["caixa"] = df["valor_dre"].where(credora, -df["valor_dre"])
+    sem_linha = df["linha"].isna()
+    df.loc[sem_linha, "caixa"] = df.loc[sem_linha, "valor"].where(df.loc[sem_linha, "sinal_confiavel"] == 1)
+    df["grupo"] = df["linha"].map(GRUPO_DFC).fillna("Não classificado")
+    df["linha_nome"] = (df["linha"].map(LINHAS).fillna(SEM_CLASSIFICACAO).str.split(" – ").str[0]
+                        .str.replace(r" \(.*\)$", "", regex=True))
+    return df.reset_index(drop=True)
+
+
+def carregar_saldo_inicial(con, cliente_id: int, competencia: str):
+    linha = con.execute("SELECT valor FROM saldos_iniciais WHERE cliente_id = ? AND competencia = ?",
+                        (cliente_id, competencia)).fetchone()
+    return float(linha[0]) if linha else None
+
+
+def salvar_saldo_inicial(con, cliente_id: int, competencia: str, valor):
+    with con:
+        if valor is None:
+            con.execute("DELETE FROM saldos_iniciais WHERE cliente_id = ? AND competencia = ?",
+                        (cliente_id, competencia))
+        else:
+            con.execute(
+                "INSERT INTO saldos_iniciais (cliente_id, competencia, valor) VALUES (?, ?, ?) "
+                "ON CONFLICT(cliente_id, competencia) DO UPDATE SET valor = excluded.valor",
+                (cliente_id, competencia, float(valor)))
+
+
+def saldo_inicial_do_mes(con, cliente_id: int, competencia: str):
+    """Saldo no 1º dia do mês e a origem: 'informado' (digitado para este mês), 'calculado' (saldo
+    informado num mês anterior + fluxo dos meses seguintes) ou 'sem_saldo' (nenhum informado: parte de 0)."""
+    informado = carregar_saldo_inicial(con, cliente_id, competencia)
+    if informado is not None:
+        return informado, "informado", competencia
+    base = con.execute("SELECT competencia, valor FROM saldos_iniciais WHERE cliente_id = ? AND competencia < ? "
+                       "ORDER BY competencia DESC LIMIT 1", (cliente_id, competencia)).fetchone()
+    if not base:
+        return 0.0, "sem_saldo", None
+    saldo, m = float(base[1]), base[0]
+    while m < competencia:
+        mov = lancamentos_caixa(con, cliente_id, m)
+        saldo += float(mov["caixa"].sum()) if len(mov) else 0.0
+        m = mes_seguinte(m)
+    return saldo, "calculado", base[0]
+
+
+def extrato_diario(lanc: pd.DataFrame, competencia: str, saldo_inicial: float) -> pd.DataFrame:
+    """Uma linha por dia do mês: entradas, saídas e saldo acumulado ao fim do dia."""
+    dias = pd.date_range(f"{competencia}-01", periods=1, freq="MS")[0]
+    todos = pd.date_range(dias, dias + pd.offsets.MonthEnd(0), freq="D")
+    validos = lanc.dropna(subset=["caixa"])
+    datas = pd.to_datetime(validos["data"])
+    entradas = validos["caixa"].clip(lower=0).groupby(datas).sum()
+    saidas = (-validos["caixa"].clip(upper=0)).groupby(datas).sum()
+    df = pd.DataFrame({"dia": todos})
+    df["entradas"] = df["dia"].map(entradas).fillna(0.0)
+    df["saidas"] = df["dia"].map(saidas).fillna(0.0)
+    df["saldo"] = saldo_inicial + (df["entradas"] - df["saidas"]).cumsum()
+    return df
+
+
+def dfc_gerencial(lanc: pd.DataFrame) -> pd.DataFrame:
+    """Totais por grupo da DFC e por linha da DRE dentro dele (com entradas e saídas)."""
+    validos = lanc.dropna(subset=["caixa"])
+    if validos.empty:
+        return pd.DataFrame(columns=["grupo", "linha_nome", "entradas", "saidas", "liquido"])
+    validos = validos.assign(linha=validos["linha"].fillna(""))
+    df = validos.groupby(["grupo", "linha", "linha_nome"], as_index=False).agg(
+        entradas=("caixa", lambda x: x.clip(lower=0).sum()), saidas=("caixa", lambda x: -x.clip(upper=0).sum()),
+        liquido=("caixa", "sum"))
+    df["ordem"] = df["grupo"].map({g: i for i, g in enumerate(ORDEM_DFC)})
+    df["ordem_linha"] = df["linha"].map({k: i for i, k in enumerate(LINHAS)}).fillna(99)  # mesma ordem da DRE
+    return (df.sort_values(["ordem", "ordem_linha"]).drop(columns=["ordem", "ordem_linha", "linha"])
+            .reset_index(drop=True))
 
 
 def valores_por_mes(con, cliente_id: int) -> pd.DataFrame:
@@ -1832,41 +1944,6 @@ def quebra_faturamento(r: dict):
     return [(nome, valor, valor / bruta * 100) for nome, valor in partes], aviso
 
 
-def grafico_quebra(partes):
-    """Barra única 100% empilhada (Altair, já vem com o Streamlit)."""
-    import altair as alt
-
-    total = sum(v for _, v, _ in partes) or 1
-    linhas, acumulado = [], 0.0
-    for i, (nome, valor, perc) in enumerate(partes):
-        inicio = acumulado / total
-        acumulado += valor
-        linhas.append({
-            "Parte": nome, "inicio": inicio, "fim": acumulado / total, "meio": (inicio + acumulado / total) / 2,
-            "Valor": brl(valor), "Percentual": pct(perc), "texto": pct(perc) if perc >= 6 else "",
-            "cor_texto": TEXTO_SOBRE_COR[i],
-        })
-    df = pd.DataFrame(linhas)
-    nomes = [p[0] for p in partes]
-    base = alt.Chart(df)
-    barras = base.mark_bar(stroke="#ffffff", strokeWidth=2, cornerRadius=4).encode(
-        x=alt.X("inicio:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%", title=None, grid=False)),
-        x2="fim:Q",
-        color=alt.Color("Parte:N", sort=nomes,
-                        scale=alt.Scale(domain=nomes, range=CORES_QUEBRA[:len(nomes)]),
-                        legend=alt.Legend(orient="bottom", title=None, columns=3)),
-        tooltip=[alt.Tooltip("Parte:N"), alt.Tooltip("Valor:N"), alt.Tooltip("Percentual:N", title="% do faturamento")],
-    )
-    # Rótulos com cor fixa (sem escala de cor própria, para não misturar com a legenda)
-    camadas = [barras]
-    for cor in sorted(set(TEXTO_SOBRE_COR[:len(nomes)])):
-        parte = df[(df["cor_texto"] == cor) & (df["texto"] != "")]
-        if not parte.empty:
-            camadas.append(alt.Chart(parte).mark_text(fontWeight="bold", fontSize=13, color=cor).encode(
-                x=alt.X("meio:Q", axis=None), text="texto:N"))
-    return alt.layer(*camadas).properties(height=90, width="container")
-
-
 # Paleta categórica validada (8 cores em ordem fixa; a 9ª+ vira "Outros" nos gráficos).
 CORES_CATEGORICAS = ["#2a78d6", "#eb6834", "#0e9fb5", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 COR_OUTROS = "#9b9a94"
@@ -1886,58 +1963,276 @@ def cores_por_grupo(ordem_grupos: list) -> dict:
             for i, g in enumerate(ordem_grupos)}
 
 
-def _rotulo_eixo_mil():
-    return "format(datum.value / 1000, '.0f') + ' mil'"
+
+# =============================================================================
+#  GRÁFICOS INTERATIVOS (PLOTLY) – identidade Eficaz Performance BPO
+# =============================================================================
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_OK = True
+except ImportError:  # o lançador instala; se faltar, os gráficos mostram um aviso em vez de quebrar
+    PLOTLY_OK = False
+
+COR_VERDE = "#0f7a3a"       # receitas / lucros
+COR_VERMELHO = "#b42318"    # despesas / prejuízos
+FONTE_GRAFICOS = "Inter, Segoe UI, sans-serif"
 
 
-def grafico_barras_grupos(por_grupo: pd.Series, cores: dict, total: float):
-    import altair as alt
-
-    df = pd.DataFrame({"grupo": por_grupo.index, "valor": por_grupo.values})
-    df["texto"] = [f"{brl(v)} · {pct(v / total * 100 if total else 0)}" for v in df["valor"]]
-    dominio = df["grupo"].tolist()
-    base = alt.Chart(df).encode(y=alt.Y("grupo:N", sort=dominio, title=None, axis=alt.Axis(labelLimit=180)))
-    barras = base.mark_bar(cornerRadiusEnd=4, size=18).encode(
-        x=alt.X("valor:Q", title=None, axis=alt.Axis(labelExpr=_rotulo_eixo_mil(), grid=False),
-                scale=alt.Scale(domainMax=max(float(df["valor"].max()), 1.0) * 1.45)),
-        color=alt.Color("grupo:N", scale=alt.Scale(domain=dominio, range=[cores[g] for g in dominio]), legend=None),
-        tooltip=[alt.Tooltip("grupo:N", title="Grupo"), alt.Tooltip("texto:N", title="Valor")],
+def layout_marca(fig, altura: int = 380, legenda: bool = True, eixo_reais: bool = True):
+    """Fundo transparente, fonte e cores da marca, números no padrão brasileiro (1.234,56)."""
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONTE_GRAFICOS, color=COR_TEXTO, size=13),
+        separators=",.",  # vírgula decimal, ponto de milhar
+        height=altura, margin=dict(l=8, r=8, t=24, b=8),
+        showlegend=legenda,
+        legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0, title=None,
+                    font=dict(size=12, color=COR_TEXTO_SECUNDARIO)),
+        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor=COR_BORDA, font=dict(family=FONTE_GRAFICOS, size=13,
+                                                                            color=COR_TEXTO)),
     )
-    textos = base.mark_text(align="left", dx=4, fontSize=11).encode(x="valor:Q", text="texto:N")
-    return alt.layer(barras, textos).properties(height=max(120, 34 * len(df)), width="container")
+    fig.update_xaxes(showgrid=False, linecolor="#C5D0DD", tickfont=dict(color=COR_TEXTO_SECUNDARIO),
+                     title=None)
+    fig.update_yaxes(gridcolor="#E3E9F1", zerolinecolor="#9AA8BA", zerolinewidth=1,
+                     tickfont=dict(color=COR_TEXTO_SECUNDARIO), title=None)
+    if eixo_reais:
+        fig.update_layout(yaxis=dict(tickprefix="R$ ", tickformat=",.0f"))
+    return fig
 
 
-def grafico_mes_a_mes(desp: pd.DataFrame, meses_grafico: list, cores: dict):
-    import altair as alt
+CONFIG_PLOTLY = {"displaylogo": False, "scrollZoom": False,
+                 "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d", "toggleSpikelines"],
+                 "toImageButtonOptions": {"format": "png", "scale": 2, "filename": "grafico_eficaz"}}
 
+
+def _versao_streamlit():
+    try:
+        from importlib.metadata import version
+        return tuple(int(p) for p in version("streamlit").split(".")[:2])
+    except Exception:  # noqa: BLE001
+        return (0, 0)
+
+
+def mostrar_grafico(construir, *args, **kwargs):
+    """Monta e exibe um gráfico Plotly ocupando toda a largura disponível."""
+    if not PLOTLY_OK:
+        st.info("📊 Para ver os gráficos interativos, feche a janela preta e abra o painel de novo: "
+                "ele instala o Plotly sozinho.")
+        return
+    fig = construir(*args, **kwargs)
+    if _versao_streamlit() >= (1, 50):  # versões novas trocaram use_container_width por width="stretch"
+        st.plotly_chart(fig, width="stretch", config=CONFIG_PLOTLY)
+    else:
+        st.plotly_chart(fig, use_container_width=True, config=CONFIG_PLOTLY)
+
+
+# --- 📊 Painel do Mês ----------------------------------------------------------
+def grafico_cascata_dre(r: dict):
+    """Cascata da formação do resultado: Receita Bruta até Lucro/Prejuízo Líquido."""
+    abaixo_ebitda = r["lucro_liquido"] - r["ebitda"]  # depreciação + resultado financeiro + IR/CSLL
+    passos = [
+        ("Receita Bruta", "relative", r["receita_bruta"]),  # parte do zero; "relative" para sair verde
+        ("(-) Impostos e Deduções", "relative", -r["impostos_vendas"]),
+        ("Receita Líquida", "total", r["receita_liquida"]),
+        ("(-) CMV / CSV", "relative", -r["custos_variaveis"]),
+        ("Lucro Bruto", "total", r["lucro_bruto"]),
+        ("(-) Desp. Comerciais Variáveis", "relative", -r["despesas_variaveis"]),
+        ("Margem de Contribuição", "total", r["margem_contribuicao"]),
+        ("(-) Custos Fixos", "relative", -r["custos_fixos"]),
+        ("EBITDA", "total", r["ebitda"]),
+        ("(+/-) Depreciação, Financ. e Impostos", "relative", abaixo_ebitda),
+        ("Lucro Líquido" if r["lucro_liquido"] >= 0 else "Prejuízo Líquido", "total", r["lucro_liquido"]),
+    ]
+    rotulos = [p[0] for p in passos]
+    textos = [brl(p[2]) for p in passos]
+    percentuais = [pct(sobre_bruta(p[2], r)) for p in passos]
+    fig = go.Figure(go.Waterfall(
+        x=rotulos, measure=[p[1] for p in passos], y=[p[2] for p in passos],
+        text=textos, textposition="outside", cliponaxis=False,
+        textfont=dict(size=11, color=COR_TEXTO),
+        customdata=list(zip(textos, percentuais)),
+        hovertemplate="<b>%{x}</b><br>%{customdata[0]}<br>%{customdata[1]} da receita bruta<extra></extra>",
+        increasing=dict(marker=dict(color=COR_VERDE)),
+        decreasing=dict(marker=dict(color=COR_VERMELHO)),
+        totals=dict(marker=dict(color=COR_MARINHO)),
+        connector=dict(line=dict(color="#9AA8BA", width=1, dash="dot")),
+    ))
+    layout_marca(fig, altura=440, legenda=False)
+    fig.update_xaxes(tickangle=-30, tickfont=dict(size=11))
+    topo = max(r["receita_bruta"], 1.0)
+    fundo = min(0.0, r["lucro_liquido"], r["ebitda"], r["margem_contribuicao"])
+    fig.update_yaxes(range=[fundo * 1.25, topo * 1.15])
+    return fig
+
+
+def grafico_donut_faturamento(partes):
+    """Para onde foi cada real faturado, em rosca (donut)."""
+    df = pd.DataFrame({"Destino": [n for n, _, _ in partes], "valor": [v for _, v, _ in partes],
+                       "Valor": [brl(v) for _, v, _ in partes], "Percentual": [pct(p) for _, _, p in partes]})
+    fig = px.pie(df, names="Destino", values="valor", hole=0.4, color="Destino",
+                 color_discrete_map={n: CORES_QUEBRA[i] for i, n in enumerate(df["Destino"])},
+                 custom_data=["Valor", "Percentual"])
+    fig.update_traces(sort=False, direction="clockwise", texttemplate=[pct(p) for _, _, p in partes],
+                      textposition="inside",
+                      insidetextorientation="horizontal", textfont=dict(size=13),
+                      marker=dict(line=dict(color="#FFFFFF", width=2)),
+                      hovertemplate="<b>%{label}</b><br>%{customdata[0][0]}<br>"
+                                    "%{customdata[0][1]} do faturamento<extra></extra>")
+    layout_marca(fig, altura=360, eixo_reais=False)
+    fig.update_layout(legend=dict(orientation="v", y=0.5, yanchor="middle", x=1.02, xanchor="left"),
+                      margin=dict(l=8, r=8, t=8, b=8))
+    return fig
+
+
+# --- 📈 Histórico ----------------------------------------------------------------
+def grafico_evolucao(periodo: list, resultados: dict):
+    """Área suave para Receita Líquida e linhas para Margem de Contribuição e Lucro Líquido."""
+    x = [nome_mes(m) for m in periodo]
+
+    def dados(chave):
+        return [resultados[m][chave] for m in periodo]
+
+    def extra(chave):
+        return [[brl(resultados[m][chave]), pct(sobre_bruta(resultados[m][chave], resultados[m]))] for m in periodo]
+
+    modelo = "%{customdata[0]} · %{customdata[1]} da receita bruta"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=dados("receita_liquida"), name="Receita Líquida", mode="lines", line_shape="spline",
+        line=dict(color=COR_CIANO_ESCURO, width=2), fill="tozeroy", fillcolor="rgba(24, 208, 232, 0.18)",
+        customdata=extra("receita_liquida"), hovertemplate=modelo))
+    fig.add_trace(go.Scatter(
+        x=x, y=dados("margem_contribuicao"), name="Margem de Contribuição", mode="lines+markers",
+        line_shape="spline", line=dict(color=COR_MARINHO, width=3),
+        marker=dict(size=8, color=COR_MARINHO, line=dict(color="#FFFFFF", width=1.5)),
+        customdata=extra("margem_contribuicao"), hovertemplate=modelo))
+    lucro = dados("lucro_liquido")
+    fig.add_trace(go.Scatter(
+        x=x, y=lucro, name="Lucro Líquido", mode="lines+markers", line_shape="spline",
+        line=dict(color=COR_VERDE, width=3, dash="dot"),
+        marker=dict(size=9, color=[COR_VERDE if v >= 0 else COR_VERMELHO for v in lucro],
+                    line=dict(color="#FFFFFF", width=1.5)),
+        customdata=extra("lucro_liquido"), hovertemplate=modelo))
+    layout_marca(fig, altura=420)
+    fig.update_layout(hovermode="x unified")
+    return fig
+
+
+# --- 💸 Despesas -----------------------------------------------------------------
+def grafico_pareto(por_categoria: pd.Series):
+    """Curva ABC: barras decrescentes por categoria e linha do % acumulado (eixo da direita, 0–100%)."""
+    serie = por_categoria[por_categoria > 0].sort_values(ascending=False)
+    total = float(serie.sum()) or 1.0
+    acumulado = serie.cumsum() / total * 100
+    classe = ["A" if a <= 80 or i == 0 else ("B" if a <= 95 else "C") for i, a in enumerate(acumulado)]
+    cores_classe = {"A": COR_MARINHO, "B": COR_MARINHO_MEDIO, "C": "#8FA3C0"}
+    nomes = list(serie.index)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=nomes, y=serie.values, name="Despesa no mês",
+        marker=dict(color=[cores_classe[c] for c in classe], cornerradius=4),
+        customdata=[[brl(v), pct(v / total * 100), c] for v, c in zip(serie.values, classe)],
+        hovertemplate="<b>%{x}</b><br>%{customdata[0]} · %{customdata[1]} do total<br>"
+                      "Classe %{customdata[2]}<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=nomes, y=acumulado.values, name="% acumulado", yaxis="y2", mode="lines+markers",
+        line=dict(color=COR_CIANO_ESCURO, width=2.5),
+        marker=dict(size=7, color=COR_CIANO, line=dict(color="#FFFFFF", width=1)),
+        customdata=[pct(a) for a in acumulado.values],
+        hovertemplate="<b>%{x}</b><br>Acumulado: %{customdata}<extra></extra>"))
+    layout_marca(fig, altura=430)
+    fig.update_layout(
+        yaxis2=dict(overlaying="y", side="right", range=[0, 105], ticksuffix="%", showgrid=False,
+                    tickfont=dict(color=COR_CIANO_ESCURO), title=None),
+        hovermode="x unified", bargap=0.25)
+    fig.add_hline(y=80, yref="y2", line=dict(color=COR_CIANO_ESCURO, width=1, dash="dash"),
+                  annotation_text="80%", annotation_position="top left",
+                  annotation_font=dict(color=COR_CIANO_ESCURO, size=11))
+    fig.update_xaxes(tickangle=-35, tickfont=dict(size=11))
+    return fig
+
+
+def grafico_despesas_mes_a_mes(desp: pd.DataFrame, meses_grafico: list, cores: dict):
+    """Barras empilhadas por grupo/natureza (os 8 maiores com cor própria, o resto em 'Outros')."""
     df = (desp[desp["competencia"].isin(meses_grafico)]
           .groupby(["competencia", "grupo"], as_index=False)["valor"].sum())
-    # Grupos sem cor própria (9º em diante) são somados em "Outros"
     df["grupo"] = df["grupo"].where(df["grupo"].map(cores) != COR_OUTROS, "Outros")
     df = df.groupby(["competencia", "grupo"], as_index=False)["valor"].sum()
-    df["mes"] = df["competencia"].map(nome_mes)
-    df["Valor"] = df["valor"].map(brl)
-    dominio = [g for g, c in cores.items() if c != COR_OUTROS] + (["Outros"] if (df["grupo"] == "Outros").any() else [])
-    faixa = [cores.get(g, COR_OUTROS) for g in dominio]
-    df["ordem"] = df["grupo"].map({g: i for i, g in enumerate(dominio)})
-    return alt.Chart(df).mark_bar(stroke="#ffffff", strokeWidth=1).encode(
-        x=alt.X("mes:N", sort=[nome_mes(m) for m in meses_grafico], title=None, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("valor:Q", stack="zero", title=None, axis=alt.Axis(labelExpr=_rotulo_eixo_mil())),
-        color=alt.Color("grupo:N", scale=alt.Scale(domain=dominio, range=faixa),
-                        legend=alt.Legend(orient="bottom", title=None, columns=3, labelLimit=200)),
-        order=alt.Order("ordem:Q"),
-        tooltip=[alt.Tooltip("mes:N", title="Mês"), alt.Tooltip("grupo:N", title="Grupo"),
-                 alt.Tooltip("Valor:N")],
-    ).properties(height=300, width="container")
+    ordem = [g for g, c in cores.items() if c != COR_OUTROS] + (["Outros"] if (df["grupo"] == "Outros").any() else [])
+    x = [nome_mes(m) for m in meses_grafico]
+    fig = go.Figure()
+    for grupo in ordem:
+        parte = df[df["grupo"] == grupo].set_index("competencia")["valor"].reindex(meses_grafico, fill_value=0)
+        fig.add_trace(go.Bar(x=x, y=parte.values, name=grupo, marker=dict(color=cores.get(grupo, COR_OUTROS)),
+                             customdata=[brl(v) for v in parte.values],
+                             hovertemplate=f"{grupo}: %{{customdata}}<extra></extra>"))
+    totais = df.groupby("competencia")["valor"].sum().reindex(meses_grafico, fill_value=0)
+    fig.add_trace(go.Scatter(x=x, y=totais.values, mode="text", text=[brl(v) for v in totais.values],
+                             textposition="top center", textfont=dict(size=11, color=COR_TEXTO_SECUNDARIO),
+                             showlegend=False, hoverinfo="skip"))
+    layout_marca(fig, altura=400)
+    fig.update_layout(barmode="stack", hovermode="x unified", bargap=0.3, legend=dict(traceorder="normal"))
+    fig.update_traces(marker_line=dict(color="#FFFFFF", width=1), selector=dict(type="bar"))
+    fig.update_yaxes(range=[0, float(totais.max() or 1) * 1.15])
+    return fig
 
 
-def estilo_marca(grafico):
-    """Eixos, grade e legendas nos tons da marca (texto marinho/cinza, grade discreta, sem moldura)."""
-    return (grafico
-            .configure_axis(labelColor=COR_TEXTO_SECUNDARIO, titleColor=COR_TEXTO_SECUNDARIO, gridColor="#E3E9F1",
-                            domainColor="#C5D0DD", tickColor="#C5D0DD", labelFontSize=11)
-            .configure_legend(labelColor=COR_TEXTO, labelFontSize=11, symbolType="square")
-            .configure_view(strokeWidth=0))
+# --- 💧 Fluxo de Caixa -------------------------------------------------------------
+def grafico_caixa_diario_plotly(extrato: pd.DataFrame):
+    """Barras de entradas (ciano) e saídas (marinho) por dia + linha do saldo acumulado."""
+    dias = extrato["dia"]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=dias, y=extrato["entradas"], name="Entradas", marker=dict(color=COR_CIANO),
+                         customdata=[brl(v) for v in extrato["entradas"]],
+                         hovertemplate="Entradas: %{customdata}<extra></extra>"))
+    fig.add_trace(go.Bar(x=dias, y=-extrato["saidas"], name="Saídas", marker=dict(color=COR_MARINHO_MEDIO),
+                         customdata=[brl(v) for v in extrato["saidas"]],
+                         hovertemplate="Saídas: %{customdata}<extra></extra>"))
+    saldo = extrato["saldo"]
+    fig.add_trace(go.Scatter(
+        x=dias, y=saldo, name="Saldo acumulado", mode="lines+markers", line=dict(color=COR_MARINHO, width=3),
+        marker=dict(size=6, color=[COR_MARINHO if v >= 0 else COR_VERMELHO for v in saldo],
+                    line=dict(color="#FFFFFF", width=1)),
+        customdata=[brl(v) for v in saldo], hovertemplate="<b>Saldo: %{customdata}</b><extra></extra>"))
+    layout_marca(fig, altura=400)
+    fig.update_layout(barmode="relative", hovermode="x unified", bargap=0.25)
+    fig.update_xaxes(tickformat="%d/%m", dtick=86400000 * 2, hoverformat="%d/%m/%Y")
+    return fig
+
+
+# --- 🎯 Orçado x Realizado --------------------------------------------------------
+def grafico_orcado_realizado(comp: list):
+    """Barras horizontais lado a lado (Orçado x Realizado) por linha da DRE, com o desvio no rótulo."""
+    itens = [c for c in comp if c["orcado"] or c["realizado"]][::-1]  # de cima para baixo na ordem da DRE
+    rotulos = [c["rotulo"] for c in itens]
+
+    def desvio_txt(c):
+        p = "" if c["dif_pct"] is None else f" ({'+' if c['dif_pct'] > 0 else ''}{pct(c['dif_pct'])})"
+        return ("+" if c["dif"] > 0 else "") + brl(c["dif"]) + p
+
+    favoravel = [(c["dif"] >= 0) == (c["chave"] in FAVORAVEL_SE_MAIOR) or abs(c["dif"]) < 0.005 for c in itens]
+    dados_hover = [[brl(c["orcado"]), brl(c["realizado"]), desvio_txt(c), c["status"]] for c in itens]
+    modelo = ("<b>%{y}</b><br>Orçado: %{customdata[0]}<br>Realizado: %{customdata[1]}<br>"
+              "Desvio: %{customdata[2]}<br>%{customdata[3]}<extra></extra>")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=rotulos, x=[c["orcado"] for c in itens], name="Orçado", orientation="h",
+                         marker=dict(color=COR_CIANO), customdata=dados_hover, hovertemplate=modelo))
+    fig.add_trace(go.Bar(y=rotulos, x=[c["realizado"] for c in itens], name="Realizado", orientation="h",
+                         marker=dict(color=COR_MARINHO), customdata=dados_hover, hovertemplate=modelo,
+                         text=[("▲ " if f else "▼ ") + (pct_com_sinal(c["dif_pct"]) if c["dif_pct"] is not None
+                                                        else com_sinal(c["dif"])) for c, f in zip(itens, favoravel)],
+                         textposition="outside", cliponaxis=False,
+                         textfont=dict(size=11, color=[COR_VERDE if f else COR_VERMELHO for f in favoravel])))
+    layout_marca(fig, altura=max(360, 46 * len(itens)), eixo_reais=False)
+    fig.update_layout(barmode="group", bargap=0.28, bargroupgap=0.08,
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0))
+    fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f", showgrid=True, gridcolor="#E3E9F1")
+    fig.update_yaxes(gridcolor="rgba(0,0,0,0)", tickfont=dict(size=12, color=COR_TEXTO))
+    maximo = max([max(c["orcado"], c["realizado"]) for c in itens] + [1.0])
+    minimo = min([min(c["orcado"], c["realizado"]) for c in itens] + [0.0])
+    fig.update_xaxes(range=[minimo * 1.2, maximo * 1.22])
+    return fig
 
 
 def gerar_pdf(cliente_nome, competencia, r, ra, anterior, comentario, comparacao=None) -> bytes:
@@ -2280,8 +2575,8 @@ if cliente["pacote"]:
 
 pagina = st.sidebar.radio(
     "Navegação",
-    ["📊 Painel do Mês", "📈 Histórico", "💸 Despesas", "🎯 Orçado x Realizado", "📥 Importar Lançamentos",
-     "🗂️ Plano de Contas"],
+    ["📊 Painel do Mês", "📈 Histórico", "💸 Despesas", "💧 Fluxo de Caixa", "🎯 Orçado x Realizado",
+     "📥 Importar Lançamentos", "🗂️ Plano de Contas"],
 )
 st.sidebar.markdown(f'<div class="marca-rodape">© {datetime.now().year} {MARCA_NOME}</div>', unsafe_allow_html=True)
 
@@ -2417,12 +2712,20 @@ if pagina == "📊 Painel do Mês":
         col.metric(titulo, brl(r[chave]), variacao(chave), help=ajuda_var)
         col.caption(f"{pct(sobre_bruta(r[chave], r))} da receita bruta")
 
+    st.subheader("🌊 Formação do resultado do mês")
+    st.caption("Da receita bruta ao lucro: verde soma, vermelho subtrai, azul-marinho são os subtotais da DRE. "
+               "Passe o mouse para ver valor e % da receita bruta.")
+    mostrar_grafico(grafico_cascata_dre, r)
+
     st.subheader("🧩 Para onde foi o faturamento")
     partes, aviso_quebra = quebra_faturamento(r)
     if partes:
         st.caption(f"De cada R$ 100,00 faturados em {nome_mes(competencia)}:")
-        st.altair_chart(estilo_marca(grafico_quebra(partes)))
-        st.dataframe(pd.DataFrame({
+        rosca, tabela_rosca = st.columns([3, 2])
+        with rosca:
+            mostrar_grafico(grafico_donut_faturamento, partes)
+        tabela_rosca.write("")
+        tabela_rosca.dataframe(pd.DataFrame({
             "Destino": [n for n, _, _ in partes],
             "Valor": [brl(v) for _, v, _ in partes],
             "% do faturamento": [pct(p) for _, _, p in partes],
@@ -2650,18 +2953,9 @@ elif pagina == "📈 Histórico":
     st.dataframe(pd.concat([historico, margens]))
 
     st.subheader("📊 Evolução")
-    datas = pd.to_datetime([f"{m}-01" for m in periodo])
-    valores = pd.DataFrame({
-        "Receita Bruta": [resultados[m]["receita_bruta"] for m in periodo],
-        "Lucro Líquido": [resultados[m]["lucro_liquido"] for m in periodo],
-        "Geração de Caixa": [resultados[m]["geracao_caixa"] for m in periodo],
-    }, index=datas)
-    st.line_chart(valores, y_label="R$", color=["#2a78d6", "#eb6834", "#1baf7a"])
-    percentuais = pd.DataFrame({
-        "Margem de Contribuição %": [resultados[m]["perc_mc"] for m in periodo],
-        "Margem Líquida %": [resultados[m]["margem_liquida"] for m in periodo],
-    }, index=datas)
-    st.line_chart(percentuais, y_label="% da receita bruta", color=["#2a78d6", "#eb6834"])
+    st.caption("Área: Receita Líquida · linhas: Margem de Contribuição e Lucro Líquido. Passe o mouse sobre um mês "
+               "para ver os três valores e as margens sobre a receita bruta. Ponto vermelho = prejuízo.")
+    mostrar_grafico(grafico_evolucao, periodo, resultados)
 
     # Exportação em Excel com números (não texto) para o BPO trabalhar
     numerico = pd.DataFrame(
@@ -2751,19 +3045,22 @@ elif pagina == "💸 Despesas":
     cores_grupo = cores_por_grupo(ordem_grupos)
 
     # --- Gráficos -------------------------------------------------------------
-    g1, g2 = st.columns([2, 3])
-    with g1:
-        st.markdown(f"**Distribuição em {nome_mes(competencia)}**")
-        if len(por_grupo_mes):
-            st.altair_chart(estilo_marca(grafico_barras_grupos(por_grupo_mes, cores_grupo, total)))
-        else:
-            st.caption("Sem despesas neste mês.")
+    st.subheader(f"🅰️ Curva ABC das despesas – {nome_mes(competencia)}")
+    por_categoria_mes = desp[desp["competencia"] == competencia].groupby("categoria")["valor"].sum()
+    if (por_categoria_mes > 0).any():
+        st.caption("Barras: cada categoria, da maior para a menor · linha ciano: % acumulado do total (eixo da "
+                   "direita). Classe A (marinho) = as que somam até 80% dos gastos: é onde está o foco.")
+        mostrar_grafico(grafico_pareto, por_categoria_mes)
+        positivos = por_categoria_mes[por_categoria_mes > 0].sort_values(ascending=False)
+        n_a = int(((positivos.cumsum() / positivos.sum() * 100) <= 80).sum()) or 1
+        st.caption(f"**{n_a} de {len(positivos)} categorias** concentram ~80% das despesas do mês.")
+    else:
+        st.caption("Sem despesas neste mês.")
     # Janela de calendário: do mesmo mês do ano anterior até o mês escolhido (13 meses), só os que têm dados
     janela = [mes_seguinte(competencia, -i) for i in range(12, -1, -1)]
     meses_grafico = [m for m in janela if m in meses]
-    with g2:
-        st.markdown("**Despesas mês a mês**")
-        st.altair_chart(estilo_marca(grafico_mes_a_mes(desp, meses_grafico, cores_grupo)))
+    st.subheader(f"🗓️ Despesas mês a mês por {nome_grupo.lower()}")
+    mostrar_grafico(grafico_despesas_mes_a_mes, desp, meses_grafico, cores_grupo)
 
     # --- Tabela detalhada -------------------------------------------------------
     st.markdown("---")
@@ -2881,6 +3178,190 @@ elif pagina == "💸 Despesas":
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ---------------------------------------------------------------------------
+# 💧 Fluxo de Caixa
+# ---------------------------------------------------------------------------
+elif pagina == "💧 Fluxo de Caixa":
+    st.title(f"💧 Fluxo de Caixa – {nome_cliente}")
+    if not meses:
+        precisa_de_dados()
+    mensagem_caixa = st.session_state.pop("msg_caixa", None)
+    if mensagem_caixa:
+        st.success(mensagem_caixa)
+
+    # --- 1. Período e saldo inicial ------------------------------------------
+    f1, f2 = st.columns([1, 2])
+    competencia = f1.selectbox("Mês", meses[::-1], format_func=nome_mes, key=f"mes_caixa_{cliente_id}")
+    saldo_ini, origem, mes_base = saldo_inicial_do_mes(con, cliente_id, competencia)
+    with f2.expander(f"🏦 Saldo inicial em banco em 01/{competencia[5:]}/{competencia[:4]}: {brl(saldo_ini)}",
+                     expanded=origem == "sem_saldo"):
+        if origem == "informado":
+            st.caption("Saldo informado manualmente para este mês.")
+        elif origem == "calculado":
+            st.caption(f"Calculado: saldo informado em {nome_mes(mes_base)} + entradas e saídas dos meses seguintes.")
+        else:
+            st.caption("Nenhum saldo informado ainda: o fluxo parte de R$ 0,00. Informe o saldo do extrato "
+                       "bancário no 1º dia do mês (some todas as contas, aplicações de liquidez imediata inclusive).")
+        novo_saldo = st.number_input("Saldo inicial (R$)", value=float(round(saldo_ini, 2)), step=100.0,
+                                     format="%.2f", key=f"saldo_ini_{cliente_id}_{competencia}")
+        b1, b2 = st.columns(2)
+        if b1.button("💾 Salvar saldo inicial", type="primary", key=f"salvar_saldo_{cliente_id}_{competencia}"):
+            salvar_saldo_inicial(con, cliente_id, competencia, novo_saldo)
+            st.session_state["msg_caixa"] = (f"Saldo inicial de {nome_mes(competencia)} salvo. Os meses seguintes "
+                                             "sem saldo informado passam a partir dele.")
+            st.rerun()
+        if origem == "informado" and b2.button("↩️ Voltar ao saldo calculado",
+                                               key=f"limpar_saldo_{cliente_id}_{competencia}"):
+            salvar_saldo_inicial(con, cliente_id, competencia, None)
+            st.rerun()
+        st.caption("Dica: informe o saldo só no primeiro mês. Os seguintes são encadeados sozinhos; informe de novo "
+                   "apenas para acertar com o extrato do banco.")
+
+    lanc_caixa = lancamentos_caixa(con, cliente_id, competencia)
+    sem_sinal = lanc_caixa[lanc_caixa["caixa"].isna()] if len(lanc_caixa) else lanc_caixa
+    if len(sem_sinal):
+        st.warning(f"⚠️ {len(sem_sinal)} lançamento(s) de categorias sem classificação vieram de arquivo sem sinal e "
+                   "ficaram fora do caixa (não dá para saber se são entrada ou saída). Classifique em "
+                   "**🗂️ Plano de Contas**: " + ", ".join(sorted(sem_sinal["categoria"].unique())[:8]))
+    validos = lanc_caixa.dropna(subset=["caixa"]) if len(lanc_caixa) else lanc_caixa
+    entradas = float(validos["caixa"].clip(lower=0).sum()) if len(validos) else 0.0
+    saidas = float(-validos["caixa"].clip(upper=0).sum()) if len(validos) else 0.0
+    saldo_fim = saldo_ini + entradas - saidas
+
+    # --- 2. Cards --------------------------------------------------------------
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Saldo inicial", brl(saldo_ini))
+    k1.caption({"informado": "informado", "calculado": f"calculado desde {nome_mes(mes_base) if mes_base else ''}",
+                "sem_saldo": "não informado"}[origem])
+    k2.metric("Entradas do mês", brl(entradas))
+    k2.caption(f"{int((validos['caixa'] > 0).sum()) if len(validos) else 0} lançamentos")
+    k3.metric("Saídas do mês", brl(saidas))
+    k3.caption(f"{int((validos['caixa'] < 0).sum()) if len(validos) else 0} lançamentos")
+    k4.metric("Saldo final do mês", brl(saldo_fim), f"{com_sinal(saldo_fim - saldo_ini)} no mês")
+    if saldo_fim < 0:
+        st.error(f"🔴 O saldo final ficou negativo ({brl(saldo_fim)}): o caixa não cobriu as saídas do mês.".replace("$", "\\$"))
+
+    # --- 3. Gráfico diário -------------------------------------------------------
+    extrato = extrato_diario(lanc_caixa if len(lanc_caixa) else pd.DataFrame({"data": [], "caixa": []}),
+                             competencia, saldo_ini)
+    st.subheader("📈 Evolução diária do caixa")
+    mostrar_grafico(grafico_caixa_diario_plotly, extrato)
+    menor = extrato.loc[extrato["saldo"].idxmin()]
+    st.caption(f"Menor saldo do mês: {brl(menor['saldo'])} em {menor['dia']:%d/%m}. "
+               "As datas são as da coluna escolhida na importação (competência ou pagamento); para um fluxo de "
+               "caixa fiel ao banco, importe usando a data de pagamento/baixa.")
+    negativos = extrato[extrato["saldo"] < 0]
+    if len(negativos) and saldo_fim >= 0:
+        st.warning(f"⚠️ O caixa ficou negativo em {len(negativos)} dia(s) do mês (primeiro: "
+                   f"{negativos.iloc[0]['dia']:%d/%m}), mesmo terminando positivo.")
+
+    # --- 4. DFC gerencial --------------------------------------------------------
+    st.markdown("---")
+    st.subheader("📋 DFC Gerencial – Demonstração dos Fluxos de Caixa")
+    dfc = dfc_gerencial(lanc_caixa) if len(lanc_caixa) else dfc_gerencial(pd.DataFrame({"caixa": []}))
+    linhas_dfc, tipos_dfc = [["Saldo inicial", "", "", brl(saldo_ini)]], ["saldo"]
+    numeros_dfc = [["Saldo inicial", None, None, saldo_ini]]  # mesma tabela em números, para o Excel
+    rotulos = {"Operacional": "(+/-) Fluxo de Caixa Operacional",
+               "Investimentos": "(+/-) Fluxo de Caixa de Investimentos",
+               "Financiamento e Sócios": "(+/-) Fluxo de Financiamento e Sócios",
+               "Não classificado": "(+/-) Não classificado (revise o Plano de Contas)"}
+    totais_grupo = {}
+    for grupo in ORDEM_DFC:
+        parte = dfc[dfc["grupo"] == grupo]
+        total = float(parte["liquido"].sum()) if len(parte) else 0.0
+        totais_grupo[grupo] = total
+        if grupo == "Não classificado" and parte.empty:
+            continue
+        linhas_dfc.append([rotulos[grupo], brl(parte["entradas"].sum()) if len(parte) else brl(0),
+                           brl(parte["saidas"].sum()) if len(parte) else brl(0), com_sinal(total)])
+        numeros_dfc.append([rotulos[grupo], float(parte["entradas"].sum()) if len(parte) else 0.0,
+                            -float(parte["saidas"].sum()) if len(parte) else 0.0, total])
+        tipos_dfc.append("grupo")
+        for item in parte.itertuples():
+            linhas_dfc.append(["      " + item.linha_nome, brl(item.entradas) if item.entradas else "–",
+                               brl(item.saidas) if item.saidas else "–", com_sinal(item.liquido)])
+            numeros_dfc.append(["      " + item.linha_nome, float(item.entradas), -float(item.saidas),
+                                float(item.liquido)])
+            tipos_dfc.append("linha")
+    variacao_caixa = sum(totais_grupo.values())
+    linhas_dfc.append(["(=) Variação do caixa no mês", brl(entradas), brl(saidas), com_sinal(variacao_caixa)])
+    tipos_dfc.append("subtotal")
+    linhas_dfc.append(["(=) Saldo final", "", "", brl(saldo_ini + variacao_caixa)])
+    numeros_dfc += [["(=) Variação do caixa no mês", entradas, -saidas, variacao_caixa],
+                    ["(=) Saldo final", None, None, saldo_ini + variacao_caixa]]
+    tipos_dfc.append("saldo")
+    tabela_dfc = pd.DataFrame(linhas_dfc, columns=["Fluxo", "Entradas", "Saídas", "Líquido"])
+
+    def estilo_dfc(linha):
+        tipo = tipos_dfc[linha.name]
+        return [{"grupo": f"background-color: {COR_CIANO_SUAVE}; color: {COR_MARINHO}; font-weight: 700",
+                 "subtotal": f"background-color: #EAF0F7; color: {COR_MARINHO}; font-weight: 700",
+                 "saldo": f"background-color: {COR_MARINHO}; color: #ffffff; font-weight: 700",
+                 "linha": ""}[tipo]] * len(linha)
+
+    st.dataframe(tabela_dfc.style.apply(estilo_dfc, axis=1), hide_index=True,
+                 height=min(36 * (len(tabela_dfc) + 1), 720))
+    diferenca = abs((saldo_ini + variacao_caixa) - saldo_fim)
+    if diferenca > 0.01:  # trava de segurança: nunca deve acontecer
+        st.error(f"❌ Reconciliação não fechou (diferença {brl(diferenca)}). Envie esta tela ao suporte.")
+    else:
+        st.caption("✅ Reconciliação: saldo inicial + operacional + investimentos + financiamento/sócios = saldo final. "
+                   "Operacional inclui receitas, impostos, custos, despesas e juros; Investimentos, compra de ativos; "
+                   "Financiamento e Sócios, amortização de empréstimos e distribuição de lucros/retiradas. "
+                   "Transferências entre contas e depreciação não entram no caixa.")
+    r_mes = resultado_do_mes(competencia)
+    if totais_grupo.get("Não classificado", 0) == 0 and abs(r_mes["geracao_caixa"] - variacao_caixa) <= 0.01:
+        st.caption(f"✅ Bate com a DRE: Geração de Caixa do Mês = {brl(r_mes['geracao_caixa'])}.")
+    else:
+        st.caption(f"ℹ️ Geração de Caixa na DRE: {brl(r_mes['geracao_caixa'])}. A diferença vem de lançamentos "
+                   "sem classificação no Plano de Contas.")
+
+    # --- 5. Extrato e exportação --------------------------------------------------
+    with st.expander("🧾 Extrato de lançamentos do mês"):
+        if len(validos):
+            extrato_lanc = validos.copy()
+            extrato_lanc["saldo"] = saldo_ini + extrato_lanc["caixa"].cumsum()
+            st.dataframe(pd.DataFrame({
+                "Data": pd.to_datetime(extrato_lanc["data"]).dt.strftime("%d/%m/%Y"),
+                "Categoria": extrato_lanc["categoria"], "Descrição": extrato_lanc["descricao"],
+                "Fluxo": extrato_lanc["grupo"], "Entrada": extrato_lanc["caixa"].clip(lower=0).map(
+                    lambda v: brl(v) if v else ""),
+                "Saída": (-extrato_lanc["caixa"].clip(upper=0)).map(lambda v: brl(v) if v else ""),
+                "Saldo": extrato_lanc["saldo"].map(brl),
+            }), hide_index=True)
+        else:
+            st.caption("Sem lançamentos de caixa neste mês.")
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as escritor:
+        resumo = pd.DataFrame({
+            "Item": ["Saldo inicial", "Entradas", "Saídas", "Saldo final"] + [f"Fluxo {g}" for g in ORDEM_DFC],
+            "Valor (R$)": [round(v, 2) for v in [saldo_ini, entradas, -saidas, saldo_fim]
+                           + [totais_grupo.get(g, 0.0) for g in ORDEM_DFC]],
+        })
+        resumo.to_excel(escritor, sheet_name="Resumo", index=False)
+        pd.DataFrame(numeros_dfc, columns=["Fluxo", "Entradas", "Saídas", "Líquido"]).round(2).to_excel(
+            escritor, sheet_name="DFC", index=False)
+        pd.DataFrame({"Dia": extrato["dia"].dt.date, "Entradas": extrato["entradas"].round(2),
+                      "Saídas": (-extrato["saidas"]).round(2), "Saldo ao fim do dia": extrato["saldo"].round(2)}
+                     ).to_excel(escritor, sheet_name="Saldo diário", index=False)
+        if len(validos):
+            pd.DataFrame({"Data": pd.to_datetime(validos["data"]).dt.date, "Categoria": validos["categoria"],
+                          "Descrição": validos["descricao"], "Linha da DRE": validos["linha_nome"],
+                          "Fluxo": validos["grupo"], "Valor no caixa": validos["caixa"].round(2),
+                          "Saldo": (saldo_ini + validos["caixa"].cumsum()).round(2)}
+                         ).to_excel(escritor, sheet_name="Extrato", index=False)
+        for aba in escritor.book.worksheets:
+            for coluna in aba.columns:
+                aba.column_dimensions[coluna[0].column_letter].width = max(
+                    12, min(48, max(len(str(c.value or "")) for c in coluna) + 2))
+                for celula in coluna[1:]:
+                    if isinstance(celula.value, float):
+                        celula.number_format = '#,##0.00;-#,##0.00'
+    st.download_button("⬇️ Exportar fluxo de caixa em Excel", buffer.getvalue(),
+                       file_name=f"Fluxo de Caixa - {nome_cliente} - {nome_mes(competencia).replace('/', '-')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ---------------------------------------------------------------------------
 # 🎯 Orçado x Realizado
 # ---------------------------------------------------------------------------
 elif pagina == "🎯 Orçado x Realizado":
@@ -2953,6 +3434,10 @@ elif pagina == "🎯 Orçado x Realizado":
                 estilo = cores[c["nivel"]] + ("; font-weight: 700" if c["total"] else "")
                 return [estilo] * len(linha)
 
+            st.markdown("**Orçado x Realizado por linha da DRE**")
+            st.caption("Ciano = orçado · marinho = realizado. O rótulo mostra o desvio: ▲ verde favorável, "
+                       "▼ vermelho desfavorável. Passe o mouse para ver o desvio exato em R$.")
+            mostrar_grafico(grafico_orcado_realizado, comp)
             st.dataframe(tabela.style.apply(colorir, axis=1), hide_index=True, height=600)
             st.caption(
                 f"🟢 dentro do orçado ou melhor · 🟡 desvio desfavorável de até {pct(TOLERANCIA_PCT)} · "
